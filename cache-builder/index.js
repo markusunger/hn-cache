@@ -1,92 +1,127 @@
-const Redis = require('ioredis');
+/* eslint-disable no-continue */
+/* eslint-disable no-await-in-loop */
+/* eslint-disable no-loop-func */
 require('dotenv').config({
   path: '../.env',
 });
 
 const request = require('./request');
+const cache = require('./cache');
+const queue = require('./queue');
 
-const redis = new Redis({
-  port: Number(process.env.CACHE_PORT),
-  host: process.env.CACHE_HOST,
-});
+// no. of concurrent HTTP requests issued
+const BATCH_SIZE = 50;
+// time interval (in milliseconds) in which to issue HTTP request batches
+const REQUEST_INTERVAL = 2000;
 
-// eslint-disable-next-line no-console
 const log = msg => console.log(msg);
 
-((async function mainTask() {
-  const timeStart = new Date();
+const errorOut = async (msg, err) => {
+  log(msg);
+  log(err);
+  await cache.close();
+  process.exit();
+};
+
+(async function mainTask() {
+  let minItemId;
+  let maxItemId;
+  const timeStart = Date.now();
   let updatedItems = 0;
   let batchesRun = 0;
-  log(`Starting cache builder at ${timeStart}.`);
+  log(`Starting cache builder at ${new Date()}.`);
 
-  // get HN API lists for top, best, etc. post id's
-  log('Requesting data for story lists ...');
-  const lists = await request.getLists();
-  if (!lists) {
-    log('Could not retrieve story lists.');
-    return;
-  }
-
-  // save story list ids in cache
   try {
-    // delete existing list keys
-    await redis.del(...Object.keys(lists).map(name => `list:${name}`));
-    const pipeline = redis.pipeline();
+    // get HN API lists for top, best, etc. post id's
+    log('Requesting data for story lists ...');
+    const lists = await request.getLists();
+
+    // delete existing list keys and save story list ids in cache
+    const cacheListNames = Object.keys(lists).map(name => `list:${name}`);
+    cache.deleteKeys(cacheListNames);
     // push all id's to new list in correct order
-    Object.keys(lists).forEach(name => pipeline.rpush(`list:${name}`, ...lists[name]));
-    await pipeline.exec();
+    cache.addLists(lists);
     log('... saved.');
+
+    // get both minimum item id from either cache or requested lists
+    // and maximum item id from HN API
+    minItemId = await cache.getMinItemId();
+    if (!minItemId) minItemId = Math.min(...([].concat(...Object.values(lists))));
+    maxItemId = await request.getMaxItemId();
   } catch (err) {
-    log(err);
-    return;
+    errorOut('Error before starting batch run', err);
   }
 
-  // get both maximum item id from API
-  // and minimum item id from requested lists
-  const minItemId = Math.min(...([].concat(...Object.values(lists))));
-  const maxItemId = await request.getMaxItemId();
-  if (!maxItemId) {
-    log('Could not retrieve maximum item id.');
-    return;
+  // create generator for all item id's to be fetched
+  const idGen = request.getNextItemIds(minItemId, maxItemId, BATCH_SIZE);
+
+  let nextBatch = idGen.next().value;
+  let allFetched;
+  try {
+    await queue.push(nextBatch);
+    allFetched = await queue.isEmpty();
+  } catch (err) {
+    log(`Could not add initial batch. No new data? (${err})`);
   }
 
-  // final step: cache all items from min to max id
-  const idGen = request.getNextItemIds(minItemId, maxItemId, 100);
+  let intervalTimer = Date.now();
 
-  // set interval to issue requests in batches every second
-  const sId = setInterval(async () => {
-    const nextIds = idGen.next().value;
-    if (!nextIds) {
-      // when all requests are made: clear timer and set new starting point
-      // for the next builder run, then disconnect from cache and exit
-      clearInterval(sId);
-      log('Validating cache ...');
-      log(`${updatedItems} items cached in ${batchesRun} batches this run.`);
-      log(`Run time: ${Date.now() - timeStart} seconds.`);
-      await redis.set('info:minitemid', maxItemId);
-      redis.disconnect();
-      process.exit();
+  while (!allFetched) {
+    // check if enough time has passed to start next iteration
+    if (Date.now() - intervalTimer < REQUEST_INTERVAL) continue;
+    // run until queue is empty
+    let nextIds;
+    try {
+      nextIds = await queue.pop(BATCH_SIZE);
+    } catch (err) {
+      // push batch of id's back into queue if their removal failed
+      queue.push(nextBatch);
+      log(err);
     }
 
-    const pipeline = redis.pipeline();
     const requestQueue = nextIds.map(id => request.getNextItem(id));
     Promise.all(requestQueue)
-      .then((responses) => {
-        // save batch of item data to cache
-        responses.forEach((response, idx) => {
+      .then(async (responses) => {
+        // create array of data for cache to save
+        const newItems = responses.reduce(async (arr, response, idx) => {
           if (response && response.data) {
             updatedItems += 1;
             const { data } = response;
-            pipeline.set(`item:${data.id}`, JSON.stringify(data));
+            arr.push(data);
           } else {
-            log(`Failed request for item ${nextIds[idx]}`);
+            log(`Failed request for item ${nextIds[idx]}. Requeueing ...`);
+            await queue.push(nextIds[idx]);
           }
-        });
-        pipeline.set('info:minitemid', nextIds[0]);
-        pipeline.exec();
-        batchesRun += 1;
-        log(`Cached items ${nextIds[0]} to ${nextIds[nextIds.length - 1]}.`);
-      })
-      .catch(() => log('Error on request batch.'));
-  }, 1000);
-}()).catch(err => log(err)));
+          return arr;
+        }, []);
+
+        // save newly fetched data to cache
+        try {
+          await cache.addItems(newItems);
+          log(`Batch of ${newItems.length} items saved.`);
+        } catch (err) {
+          log(`Could not save newly fetched items. Requeueing whole batch (${err})...`);
+          await queue.push(nextIds);
+        }
+      }, async (err) => {
+        log(`Failed batch. Requeueing all id's (${err})...`);
+        await queue.push(nextIds);
+      });
+
+    batchesRun += 1;
+    nextBatch = idGen.next().value;
+    try {
+      await queue.push(nextBatch);
+    } catch (err) {
+      log(`Could not add next batch to queue (${err}).`);
+    }
+
+    intervalTimer = Date.now();
+    allFetched = await queue.isEmpty();
+  }
+
+  cache.close();
+  log(`Fetched ${updatedItems} in ${batchesRun} batches.`);
+  log(`Time lapsed: ${timeStart - Date.now()} seconds`);
+  process.exit();
+}());
