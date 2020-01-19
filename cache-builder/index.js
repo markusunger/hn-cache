@@ -23,13 +23,53 @@ const errorOut = async (msg, err) => {
   process.exit();
 };
 
-(async function mainTask() {
+((async function mainTask() {
   let minItemId;
   let maxItemId;
+  let idGen;
   const timeStart = Date.now();
   let updatedItems = 0;
   let batchesRun = 0;
   log(`Starting cache builder at ${new Date()}.`);
+
+  const batchRun = async () => {
+    const next = idGen.next().value;
+    if (next) await queue.push(next);
+
+    const queueEmpty = await queue.isEmpty();
+    if (queueEmpty) {
+      log(`Fetched ${updatedItems} items in ${batchesRun} batches.`);
+      log(`Time lapsed: ${Date.now() - timeStart / 1000} seconds.`);
+      await cache.setMinItemId(maxItemId);
+      await cache.close();
+      process.exit();
+    }
+
+    const batch = await queue.pop(BATCH_SIZE);
+    const requests = batch.map(id => request.getNextItem(id));
+    try {
+      log(`Requesting batch of ${batch.length} items (${batch[0]} .. ${batch[batch.length - 1]})...`);
+      const responses = await Promise.all(requests);
+      const data = responses.reduce((arr, response, idx) => {
+        const hasData = Object.prototype.hasOwnProperty.call(response, 'data');
+        if (response && hasData) {
+          const hasId = Object.prototype.hasOwnProperty.call(response.data, 'id');
+          if (!hasId) response.data.id = batch[idx];
+          arr.push(response.data);
+          updatedItems += 1;
+        } else {
+          queue.push([batch[idx]]);
+        }
+        return arr;
+      }, []);
+      await cache.addItems(data);
+      log(`Added ${data.length} items.`);
+    } catch (err) {
+      log(`Requeueing batch after error: ${err}`);
+      await queue.push(batch);
+    }
+    batchesRun += 1;
+  };
 
   try {
     // get HN API lists for top, best, etc. post id's
@@ -52,76 +92,11 @@ const errorOut = async (msg, err) => {
     errorOut('Error before starting batch run', err);
   }
 
-  // create generator for all item id's to be fetched
-  const idGen = request.getNextItemIds(minItemId, maxItemId, BATCH_SIZE);
+  log(`Starting fetching items with id's from ${minItemId} to ${maxItemId}`);
+  log(`Total items: ${maxItemId - minItemId}`);
+  log(`Estimated time: ${((maxItemId - minItemId) / (BATCH_SIZE / (REQUEST_INTERVAL / 1000))) / 60} minutes.`);
 
-  let nextBatch = idGen.next().value;
-  let allFetched;
-  try {
-    await queue.push(nextBatch);
-    allFetched = await queue.isEmpty();
-  } catch (err) {
-    log(`Could not add initial batch. No new data? (${err})`);
-  }
+  idGen = request.getNextItemIds(minItemId, maxItemId, BATCH_SIZE);
 
-  let intervalTimer = Date.now();
-
-  while (!allFetched) {
-    // check if enough time has passed to start next iteration
-    if (Date.now() - intervalTimer < REQUEST_INTERVAL) continue;
-    // run until queue is empty
-    let nextIds;
-    try {
-      nextIds = await queue.pop(BATCH_SIZE);
-    } catch (err) {
-      // push batch of id's back into queue if their removal failed
-      queue.push(nextBatch);
-      log(err);
-    }
-
-    const requestQueue = nextIds.map(id => request.getNextItem(id));
-    Promise.all(requestQueue)
-      .then(async (responses) => {
-        // create array of data for cache to save
-        const newItems = responses.reduce(async (arr, response, idx) => {
-          if (response && response.data) {
-            updatedItems += 1;
-            const { data } = response;
-            arr.push(data);
-          } else {
-            log(`Failed request for item ${nextIds[idx]}. Requeueing ...`);
-            await queue.push(nextIds[idx]);
-          }
-          return arr;
-        }, []);
-
-        // save newly fetched data to cache
-        try {
-          await cache.addItems(newItems);
-          log(`Batch of ${newItems.length} items saved.`);
-        } catch (err) {
-          log(`Could not save newly fetched items. Requeueing whole batch (${err})...`);
-          await queue.push(nextIds);
-        }
-      }, async (err) => {
-        log(`Failed batch. Requeueing all id's (${err})...`);
-        await queue.push(nextIds);
-      });
-
-    batchesRun += 1;
-    nextBatch = idGen.next().value;
-    try {
-      await queue.push(nextBatch);
-    } catch (err) {
-      log(`Could not add next batch to queue (${err}).`);
-    }
-
-    intervalTimer = Date.now();
-    allFetched = await queue.isEmpty();
-  }
-
-  cache.close();
-  log(`Fetched ${updatedItems} in ${batchesRun} batches.`);
-  log(`Time lapsed: ${timeStart - Date.now()} seconds`);
-  process.exit();
-}());
+  setInterval(batchRun, REQUEST_INTERVAL);
+}()).catch(err => errorOut('Something went wrong.', err)));
