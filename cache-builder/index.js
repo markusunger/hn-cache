@@ -1,6 +1,3 @@
-/* eslint-disable no-continue */
-/* eslint-disable no-await-in-loop */
-/* eslint-disable no-loop-func */
 require('dotenv').config({
   path: '../.env',
 });
@@ -33,31 +30,42 @@ const errorOut = async (msg, err) => {
   log(`Starting cache builder at ${new Date()}.`);
 
   const batchRun = async () => {
+    // invoked by setInterval for individual batches,
+    // enqueues new ids and fetches others
     const next = idGen.next().value;
     if (next) await queue.push(next);
 
     const queueEmpty = await queue.isEmpty();
     if (queueEmpty) {
+      // print information about builder run once queue is empty
+      // then clean up and exit
       log(`Fetched ${updatedItems} items in ${batchesRun} batches.`);
-      log(`Time lapsed: ${Date.now() - timeStart / 1000} seconds.`);
+      log(`Time lapsed: ${parseFloat((Date.now() - timeStart) / 1000 / 60).toFixed(2)} minutes.`);
       await cache.setMinItemId(maxItemId);
       await cache.close();
       process.exit();
     }
 
+    // get next batch of ids and convert to request promises
     const batch = await queue.pop(BATCH_SIZE);
     const requests = batch.map(id => request.getNextItem(id));
+
     try {
       log(`Requesting batch of ${batch.length} items (${batch[0]} .. ${batch[batch.length - 1]})...`);
       const responses = await Promise.all(requests);
       const data = responses.reduce((arr, response, idx) => {
-        const hasData = Object.prototype.hasOwnProperty.call(response, 'data');
-        if (response && hasData) {
-          const hasId = Object.prototype.hasOwnProperty.call(response.data, 'id');
-          if (!hasId) response.data.id = batch[idx];
+        if (response) {
+          if (!response.data) {
+            // handle those pesky valid null responses from the API
+            response.data = {};
+            response.data.id = batch[idx];
+          }
           arr.push(response.data);
           updatedItems += 1;
         } else {
+          // when Promise.all fails, there's no way to determine which single
+          // item might be responsible, so we requeue the whole batch
+          log(`No valid response, requeueing item ${batch[idx]} ...`);
           queue.push([batch[idx]]);
         }
         return arr;
@@ -79,7 +87,7 @@ const errorOut = async (msg, err) => {
     // delete existing list keys and save story list ids in cache
     const cacheListNames = Object.keys(lists).map(name => `list:${name}`);
     cache.deleteKeys(cacheListNames);
-    // push all id's to new list in correct order
+    // push all ids to new list in correct order
     cache.addLists(lists);
     log('... saved.');
 
@@ -92,9 +100,12 @@ const errorOut = async (msg, err) => {
     errorOut('Error before starting batch run', err);
   }
 
+  const timeEstimated = parseFloat(
+    ((maxItemId - minItemId) / (BATCH_SIZE / (REQUEST_INTERVAL / 1000))) / 60,
+  ).toFixed(2);
   log(`Starting fetching items with id's from ${minItemId} to ${maxItemId}`);
-  log(`Total items: ${maxItemId - minItemId}`);
-  log(`Estimated time: ${((maxItemId - minItemId) / (BATCH_SIZE / (REQUEST_INTERVAL / 1000))) / 60} minutes.`);
+  log(`Total no. of items: ${maxItemId - minItemId}`);
+  log(`Estimated time: ${timeEstimated} minutes.`);
 
   idGen = request.getNextItemIds(minItemId, maxItemId, BATCH_SIZE);
 
