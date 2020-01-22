@@ -25,11 +25,11 @@ module.exports = {
 
   getMinItemId: async function getMinItemId() {
     const minId = await redis.get('cache:minId');
-    return minId;
+    return Number(minId);
   },
 
   setMinItemId: async function setMinItemId(id) {
-    const result = await redis.set('cache:minId', id);
+    const result = await redis.set('cache:minId', Number(id));
     return result;
   },
 
